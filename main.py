@@ -4,9 +4,8 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 import math
 
-app = FastAPI(title="高資產客戶傳承與稅務精算後端大腦", version="3.1")
+app = FastAPI(title="高資產傳承與所得稅擇優核算大腦", version="3.5")
 
-# 啟動跨來源資源共用 (CORS)，確保前端 Next.js 能順利連線
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,7 +14,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. 定義與前端 Next.js 完全對接的 Pydantic 資料模型 ---
+# --- 1. 資料結構對接 Schema ---
 class TimelineSchema(BaseModel):
     current_age: int
     life_expectancy: int
@@ -41,7 +40,9 @@ class InsuranceSchema(BaseModel):
     type: str
     app: str
     ins: str
-    ben: str
+    ben: List[str]
+    custom_ben: Optional[str] = ""
+    ben_allocation: str
     premium: float
     years: int
     cv: float
@@ -91,6 +92,7 @@ class KidSchema(BaseModel):
     age: int
     dep_age: int
     life: int
+    disabled: bool
     ltc: bool
 
 class SiblingSchema(BaseModel):
@@ -115,6 +117,8 @@ class FamilySchema(BaseModel):
     sp_ltc: bool
     kids: List[KidSchema]
     siblings: List[SiblingSchema]
+    daily_tool_val: float
+    job_tool_val: float
 
 class PensionSchema(BaseModel):
     mode: str
@@ -131,179 +135,245 @@ class SimulationPayload(BaseModel):
     events: List[EventSchema]
     family: FamilySchema
     pension: PensionSchema
+    tax_params: Dict[str, float]
     main_salary: float
     base_m_exp: float
 
-# --- 2. 台灣綜合所得稅法定級距計算 (2024最新修正) ---
-def calc_tw_income_tax(taxable_net_income_yuan: float) -> float:
-    net_inc_wan = taxable_net_income_yuan / 10000
-    if net_inc_wan <= 56:
-        return (net_inc_wan * 0.05) * 10000
-    elif net_inc_wan <= 126:
-        return (net_inc_wan * 0.12 - 3.92) * 10000
-    elif net_inc_wan <= 252:
-        return (net_inc_wan * 0.20 - 14.0) * 10000
-    elif net_inc_wan <= 498:
-        return (net_inc_wan * 0.30 - 39.2) * 10000
-    else:
-        return (net_inc_wan * 0.40 - 89.0) * 10000
+def calc_tw_tax(net_inc: float) -> float:
+    if net_inc <= 56: return net_inc * 0.05
+    elif net_inc <= 126: return net_inc * 0.12 - 3.92
+    elif net_inc <= 252: return net_inc * 0.20 - 14.0
+    elif net_inc <= 498: return net_inc * 0.30 - 39.2
+    else: return net_inc * 0.40 - 89.0
 
-# --- 3. 核心精算模擬路由端點 ---
+# --- 2. 核心運算路由 ---
 @app.post("/api/v1/wealth/simulate")
 async def simulate_wealth_trajectory(payload: SimulationPayload):
     try:
         t = payload.timeline
         f = payload.family
+        tp = payload.tax_params
         
+        LIQUIDATION_ORDER = ["現金", "保單", "基金", "債券", "股票", "其他", "不動產"]
         trajectory = []
         
-        # 初始化動態資產水庫 (元)
         cur_bal = {a.name: a.value * 10000 for a in payload.assets}
+        sub_to_cat = {a.name: a.type for a in payload.assets}
         rate_dict = {a.name: a.rate for a in payload.assets}
         tax_dict = {a.name: a.tax_type for a in payload.assets}
         
-        # 確保有系統預設活存總水庫
         if "日常活存" not in cur_bal:
             cur_bal["日常活存"] = 0.0
+            sub_to_cat["日常活存"] = "現金"
             rate_dict["日常活存"] = 0.01
             tax_dict["日常活存"] = "國內利息(計入27萬)"
 
-        # 複製保單動態陣列，用於計算複利保價金
         sim_ins = [ins.model_copy() for ins in payload.insurances]
+        accumulated_deficit = 0.0
 
-        # 終身時間軸精算迴圈 (逐年推演)
         for age in range(t.current_age, t.life_expectancy + 1):
             yrs = age - t.current_age
             row_data = {"年紀": age}
+            cur_house = 0.0
+            item_mortgage_interest = 0.0
             
-            # 房貸與信貸當年度支出核算
-            year_mortgage_pay = 0.0
-            year_mortgage_interest_wan = 0.0
+            # 房貸與繳息
             for h in payload.mortgages:
                 if h.start <= age < h.start + h.years:
-                    # 寬限期本息攤還精密計算
                     p_yrs = age - h.start
                     loan_yuan = h.loan_amount * 10000
+                    m_rate = (h.rate / 100) / 12
                     if p_yrs < h.grace:
-                        interest = loan_yuan * h.rate
-                        year_mortgage_pay += interest
-                        year_mortgage_interest_wan += interest / 10000
+                        interest = loan_yuan * (h.rate / 100)
+                        cur_house += interest
+                        if h.claim_tax: item_mortgage_interest += interest / 10000
                     else:
-                        # 寬限期後本利平均攤還
-                        amort_years = h.years - h.grace
-                        m_rate = h.rate / 12
-                        m_pmt = (loan_yuan * m_rate * ((1+m_rate)**(amort_years*12))) / (((1+m_rate)**(amort_years*12)) - 1)
-                        year_mortgage_pay += m_pmt * 12
-                        year_mortgage_interest_wan += (loan_yuan * h.rate) / 10000
-            
-            year_debt_pay = sum(d.monthly_pay * 12 for d in payload.debts if d.start <= age < d.start + d.years)
-            
-            # 處理多元額外所得
+                        amort_months = (h.years - h.grace) * 12
+                        pmt = (loan_yuan * m_rate * (1+m_rate)**amort_months) / ((1+m_rate)**amort_months - 1)
+                        cur_house += pmt * 12
+                        year_interest = loan_yuan * (h.rate / 100) # 概估
+                        if h.claim_tax: item_mortgage_interest += year_interest / 10000
+
+            cur_debt = sum(d.monthly_pay * 12 for d in payload.debts if d.start <= age < d.start + d.years)
+
+            # 多元所得拆解
             cur_extra_inc_gross = 0.0
-            cur_extra_inc_taxable = 0.0
+            cur_extra_inc_net_taxable = 0.0
+            total_9b_annual = 0.0
             for inc in payload.extra_incomes:
                 annual_gross = inc.monthly_amt * 12
                 cur_extra_inc_gross += annual_gross
-                if "9A" in inc.type:
-                    cur_extra_inc_taxable += annual_gross * 0.7
-                elif "51" in inc.type:
-                    cur_extra_inc_taxable += annual_gross * 0.57
-                else:
-                    cur_extra_inc_taxable += annual_gross
+                if "9B" in inc.type: total_9b_annual += annual_gross
+                elif "9A" in inc.type: cur_extra_inc_net_taxable += annual_gross * 0.7
+                elif "租賃" in inc.type: cur_extra_inc_net_taxable += annual_gross * 0.57
+                else: cur_extra_inc_net_taxable += annual_gross
+            if total_9b_annual > 180000: cur_extra_inc_net_taxable += (total_9b_annual - 180000)
 
-            # 處理保單現金流、保價金與身故保額複合成長
+            # 保單現金流
             ins_premium_total = 0.0
             ins_survival_total = 0.0
             total_cv_wan = 0.0
-            
+            trigger_amt_base = 0.0
+            estate_cv_addition_wan = 0.0
+            insurance_payouts = {}
+
             for p in sim_ins:
+                p_prem_yuan = p.premium * 10000
+                p_surv_yuan = p.survival * 10000
                 if age < (t.current_age + p.years):
-                    ins_premium_total += p.premium * 10000
+                    ins_premium_total += p_prem_yuan
                     p.cv = (p.cv + p.premium) * (1 + p.irr)
                 else:
                     p.cv = p.cv * (1 + p.irr)
-                
                 p.db = max(p.db, p.cv)
                 total_cv_wan += p.cv
 
-            # ✅ 修復點：主業收入與退休金自動對接判斷 (使用 payload.main_salary)
-            if age < t.retire_age:
-                year_salary = payload.main_salary * 12 * ((1 + t.salary_growth) ** yrs)
-                year_pension = 0.0
-                year_living_exp = payload.base_m_exp * 12 * ((1 + t.inflation_rate) ** yrs)
-            else:
-                year_salary = 0.0
-                calc_salary = payload.main_salary if payload.main_salary < 45800 else 45800
-                year_pension = calc_salary * payload.pension.lb_current_years * 0.0155 * 12
-                year_living_exp = (payload.base_m_exp * t.replacement_rate) * 12 * ((1 + t.inflation_rate) ** (age - t.retire_age))
+                if age >= p.survival_age and p.survival > 0:
+                    ins_survival_total += p_surv_yuan
 
-            # 當年總流入與總流出核算
-            total_inflow = year_salary + year_pension + cur_extra_inc_gross + ins_survival_total
-            total_outflow = year_living_exp + year_mortgage_pay + year_debt_pay + ins_premium_total
-            
-            # --- 4. 年度綜合所得稅與最低稅負制 (AMT) 合流最優化試算 ---
+                if p.app == '本人' and p.ins == '本人':
+                    trigger_amt_base += max(0.0, p.db - 3740.0)
+                    for b in p.ben:
+                        b_name = p.custom_ben if b == "其他(自行輸入)" else b
+                        if p.ben_allocation == "均分比例":
+                            insurance_payouts[b_name] = insurance_payouts.get(b_name, 0.0) + (p.db * 10000 / len(p.ben))
+                        else:
+                            insurance_payouts[p.ben[0]] = p.db * 10000
+                elif p.app == '本人':
+                    estate_cv_addition_wan += p.cv
+
+            if age < t.retire_age:
+                temp_salary = payload.main_salary * 12 * ((1 + t.salary_growth)**yrs)
+                temp_pension = 0.0
+                display_living_exp = payload.base_m_exp * 12 * ((1 + t.inflation_rate)**yrs)
+            else:
+                temp_salary = 0.0
+                calc_salary = payload.main_salary if payload.main_salary < 45800 else 45800
+                temp_pension = calc_salary * payload.pension.lb_current_years * 0.0155 * 12
+                display_living_exp = payload.base_m_exp * t.replacement_rate * 12 * ((1 + t.inflation_rate)**(age - t.retire_age))
+
+            cur_inc = temp_salary + cur_extra_inc_gross + temp_pension + ins_survival_total
+            current_year_net_inflow = cur_inc - display_living_exp - cur_house - cur_debt - ins_premium_total
+
+            # --- 所得稅最佳化擇優雙軌計算 ---
             is_spouse_alive = f.has_spouse and (f.sp_age + yrs < f.sp_life)
             tax_people = 1 + (1 if is_spouse_alive else 0) + len(f.kids) + (1 if f.has_father else 0) + (1 if f.has_mother else 0)
+            total_exemption = (tp["exemption"] * 1.5) if age >= 70 else tp["exemption"]
+            inc_tax_disabled_count = 1 if f.sp_disabled else 0
+            ltc_count = 1 if f.sp_ltc else 0
+            preschool_ded = 0.0
             
-            exemption_pool = 97000 * tax_people
-            std_deduction = 131000 * (2 if is_spouse_alive else 1)
-            salary_deduction = 218000 if age < t.retire_age else 0
-            
-            itemized_mortgage = min(year_mortgage_interest_wan * 10000, 300000)
-            chosen_deduction = max(std_deduction, itemized_mortgage)
-            
-            gross_income_total = year_salary + cur_extra_inc_taxable
-            net_income_taxable = max(0, gross_income_total - exemption_pool - chosen_deduction - salary_deduction)
-            
-            general_income_tax = calc_tw_income_tax(net_income_taxable)
-            amt_basic_income = net_income_taxable + 0.0
-            amt_tax = max(0, amt_basic_income - 7500000) * 0.2
-            
-            final_year_tax = max(general_income_tax, amt_tax)
-            total_outflow += final_year_tax
-
-            # 結餘注入活存總水庫
-            net_year_cashflow = total_inflow - total_outflow
-            cur_bal["日常活存"] += net_year_cashflow
-
-            for name in cur_bal.keys():
-                cur_bal[name] = cur_bal[name] * (1 + rate_dict.get(name, 0.01))
-
-            year_total_assets_wan = (sum(cur_bal.values()) / 10000) + total_cv_wan
-            
-            # --- 5. 當年度模擬身故民法與傳承遺產稅預估 ---
-            estate_tax_exempt = 1333.0
-            estate_deductions = 138.0
             if is_spouse_alive:
-                estate_tax_exempt += 553.0
-            estate_tax_exempt += (56.0 * len(f.kids))
-            
-            sp_claim_wan = max(0, (year_total_assets_wan - f.sp_wealth) / 2) if is_spouse_alive else 0.0
-            taxable_estate_net = max(0, year_total_assets_wan - estate_tax_exempt - sp_claim_wan)
-            
-            if taxable_estate_net <= 5621:
-                estate_tax_wan = taxable_estate_net * 0.1
-            elif taxable_estate_net <= 11242:
-                estate_tax_wan = 562.1 + (taxable_estate_net - 5621) * 0.15
-            else:
-                estate_tax_wan = 562.1 + 843.15 + (taxable_estate_net - 11242) * 0.2
+                total_exemption += (tp["exemption"] * 1.5) if (f.sp_age + yrs) >= 70 else tp["exemption"]
 
-            # 寫入年度軌跡封包
-            row_data.update({
-                "總資產_萬": round(year_total_assets_wan, 1),
-                "預估遺產稅_萬": round(estate_tax_wan, 1),
-                "差額分配請求權": round(sp_claim_wan, 1),
-                "扣除額總計": estate_tax_exempt,
-                "收_年金收入": year_pension,
-                "支_所得稅金": final_year_tax
+            for k in f.kids:
+                if k.age + yrs <= k.dep_age:
+                    tax_people += 1
+                    total_exemption += tp["exemption"]
+                    if k.age + yrs <= 6: preschool_ded += tp["preschool_1st"]
+                    if k.disabled: inc_tax_disabled_count += 1
+                    if k.ltc: ltc_count += 1
+
+            user_salary_wan = temp_salary / 10000
+            biz_other_wan = cur_extra_inc_net_taxable / 10000
+            if age >= t.retire_age: biz_other_wan += max(0.0, (temp_pension / 10000) - tp["retire_exempt"])
+
+            interest_inc, dividend_inc, overseas_inc, amt_ins_inc = 0.0, 0.0, 0.0, 0.0
+            for nm, val in cur_bal.items():
+                lbl = tax_dict.get(nm, "")
+                yield_wan = (val / 10000) * rate_dict.get(nm, 0.01)
+                if "利息" in lbl: interest_inc += yield_wan
+                elif "股利" in lbl: dividend_inc += yield_wan
+                elif "海外" in lbl: overseas_inc += yield_wan
+                elif "保單" in lbl: amt_ins_inc += yield_wan
+
+            savings_deduction = min(interest_inc, tp["savings_limit"])
+            taxable_interest = interest_inc - savings_deduction
+            std_deduction = tp["std_deduction"] * (2 if is_spouse_alive else 1)
+            item_ins = min((mInsurance * 12) / 10000 if 'mInsurance' in globals() else 2.4, tp["ins_limit"] * tax_people)
+            item_mortgage_final = min(max(0.0, item_mortgage_interest - savings_deduction), tp["mortgage_limit"])
+            final_deduction = max(std_deduction, item_ins + item_mortgage_final)
+            
+            total_special_ded = savings_deduction + (inc_tax_disabled_count * tp["inc_disabled_ded"]) + (ltc_count * tp["ltc_deduction"]) + preschool_ded
+            basic_living_diff = max(0.0, (tax_people * tp["basic_living"]) - (total_exemption + final_deduction + total_special_ded))
+            user_sal_ded = min(user_salary_wan, tp["salary_deduction"])
+
+            # 雙軌計稅自動擇優
+            def check_tax(add_div):
+                gross = user_salary_wan + biz_other_wan + taxable_interest + (dividend_inc if add_div else 0.0)
+                net = max(0.0, gross - total_exemption - final_deduction - total_special_ded - basic_living_diff - user_sal_ded)
+                return calc_tw_tax(net), net
+
+            tax_joint, joint_net = check_tax(add_div=True)
+            tax_scen1 = max(0.0, tax_joint - min(dividend_inc * 0.085, 8.0))
+            tax_no_div, _ = check_tax(add_div=False)
+            tax_scen2 = tax_no_div + (dividend_inc * 0.28)
+            general_tax = min(tax_scen1, tax_scen2)
+
+            basic_income = joint_net + overseas_inc + amt_ins_inc
+            amt_tax = max(0.0, basic_income - tp["amt_threshold"]) * 0.2
+            final_income_tax_wan = max(general_tax, amt_tax)
+            
+            current_year_net_inflow -= (final_income_tax_wan * 10000)
+
+            # 現金流對沖與救火隊排程
+            if current_year_net_inflow > 0:
+                if accumulated_deficit > 0:
+                    payoff = min(current_year_net_inflow, accumulated_deficit)
+                    accumulated_deficit -= payoff
+                    current_year_net_inflow -= payoff
+                cur_bal["日常活存"] += current_year_net_inflow
+            else:
+                deficit = abs(current_year_net_inflow)
+                for cat in LIQUIDATION_ORDER:
+                    if deficit <= 0: break
+                    for k, v in sub_to_cat.items():
+                        if v == cat and cur_bal.get(k, 0) > 0:
+                            take = min(cur_bal[k], deficit)
+                            cur_bal[k] -= take
+                            deficit -= take
+                if deficit > 0: accumulated_deficit += deficit
+
+            # 資產加總
+            total_a = sum(cur_bal.values())
+            total_a_wan = (total_a / 10000) + total_cv_wan
+            total_liab_wan = (cur_debt + accumulated_deficit) / 10000
+
+            # 遺產免稅資產與扣除
+            total_a_wan_estate = total_a_wan + estate_cv_addition_wan
+            ded_total = 1333.0 + 138.0
+            ded_details = {"免稅額": 1333.0, "喪葬費": 138.0}
+            alive_dict = {"配偶": [], "子女": [], "父母": [], "兄弟姊妹": [], "祖父母": []}
+            if is_spouse_alive:
+                alive_dict["配偶"].append({"name": "配偶"})
+                ded_total += 553.0; ded_details["配偶扣除額"] = 553.0
+            for k in f.kids:
+                alive_dict["子女"].append({"name": k.id})
+                ded_total += 56.0 + max(0.0, (18 - (k.age + yrs)) * 56.0)
+            
+            sp_claim_wan = max(0.0, (total_a_wan_estate - f.sp_wealth) / 2) if is_spouse_alive else 0.0
+            taxable_net_wan = max(0.0, total_a_wan_estate - total_liab_wan - min(f.daily_tool_val, 100.0) - min(f.job_tool_val, 56.0) - sp_claim_wan - ded_total)
+            
+            if taxable_net_wan <= 5621: tax_wan = taxable_net_wan * 0.1
+            elif taxable_net_wan <= 11242: tax_wan = 562.1 + (taxable_net_wan - 5621) * 0.15
+            else: tax_wan = 562.1 + 843.15 + (taxable_net_wan - 11242) * 0.2
+
+            trajectory.append({
+                "年紀": age, "總資產_萬": round(total_a_wan, 0), "預估遺產稅_萬": round(tax_wan, 0),
+                "差額分配請求權": round(sp_claim_wan, 0), "扣除額總計": ded_total, "收_年金收入": round(temp_pension, 0),
+                "支_所得稅金": round(final_income_tax_wan * 10000, 0), "收_主業薪資": round(temp_salary, 0),
+                "收_其他所得": round(cur_extra_inc_gross, 0), "收_保險還本": round(ins_survival_total, 0),
+                "支_生活開銷": round(display_living_exp, 0), "支_保險費": round(ins_premium_total, 0),
+                "保單總價值": total_cv_wan, "保單理賠分配": insurance_payouts, "身故觸發受益人AMT_預估": trigger_amt_base,
+                "民法繼承基數": max(0.0, total_a_wan_estate - total_liab_wan - sp_claim_wan),
+                "可分配餘額": max(0.0, total_a_wan_estate - total_liab_wan - tax_wan - sp_claim_wan),
+                "扣除額明細": ded_details, "存活字典": alive_dict, "股利計稅": "合併計稅" if tax_scenario_1 <= tax_scenario_2 else "分開計稅",
+                "觸發AMT": "是" if amt_tax > general_tax else "否", "稅_綜合所得總額": gross_income_total,
+                "稅_綜合所得淨額": joint_net, "稅_一般應納稅額": general_tax, "稅_AMT基本所得額": basic_income, "稅_AMT稅額": amt_tax,
+                "稅_免稅額": total_exemption, "稅_扣除額": final_deduction, "稅_特扣總計": total_special_ded, "稅_基本差額": basic_living_diff,
+                "稅_申報人數": tax_people, "扣除額類型": "列舉" if item_ins + item_mortgage_final > std_deduction else "標準"
             })
-            trajectory.append(row_data)
 
         return {"trajectory": trajectory}
-
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"核心精算引擎崩潰: {str(e)}")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        raise HTTPException(status_code=500, detail=f"核心引擎精算異常: {str(e)}")
