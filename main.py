@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 import math
 
-app = FastAPI(title="高資產客戶傳承與稅務精算後端大腦", version="3.0")
+app = FastAPI(title="高資產客戶傳承與稅務精算後端大腦", version="3.1")
 
 # 啟動跨來源資源共用 (CORS)，確保前端 Next.js 能順利連線
 app.add_middleware(
@@ -194,7 +194,7 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                         m_rate = h.rate / 12
                         m_pmt = (loan_yuan * m_rate * ((1+m_rate)**(amort_years*12))) / (((1+m_rate)**(amort_years*12)) - 1)
                         year_mortgage_pay += m_pmt * 12
-                        year_mortgage_interest_wan += (loan_yuan * h.rate) / 10000 # 簡化利息推估
+                        year_mortgage_interest_wan += (loan_yuan * h.rate) / 10000
             
             year_debt_pay = sum(d.monthly_pay * 12 for d in payload.debts if d.start <= age < d.start + d.years)
             
@@ -211,13 +211,12 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                 else:
                     cur_extra_inc_taxable += annual_gross
 
-            # 處理保單現金流、保價金與身故保額複合成長 (核心傳承法規)
+            # 處理保單現金流、保價金與身故保額複合成長
             ins_premium_total = 0.0
             ins_survival_total = 0.0
             total_cv_wan = 0.0
             
             for p in sim_ins:
-                # 扣除繳費與發放生存金
                 if age < (t.current_age + p.years):
                     ins_premium_total += p.premium * 10000
                     p.cv = (p.cv + p.premium) * (1 + p.irr)
@@ -227,42 +226,37 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                 p.db = max(p.db, p.cv)
                 total_cv_wan += p.cv
 
-            # 主業收入與退休金自動對接判斷
+            # ✅ 修復點：主業收入與退休金自動對接判斷 (使用 payload.main_salary)
             if age < t.retire_age:
-                year_salary = mainSalary * 12 * ((1 + t.salary_growth) ** yrs)
+                year_salary = payload.main_salary * 12 * ((1 + t.salary_growth) ** yrs)
                 year_pension = 0.0
-                year_living_exp = baseExp * 12 * ((1 + t.inflation_rate) ** yrs)
+                year_living_exp = payload.base_m_exp * 12 * ((1 + t.inflation_rate) ** yrs)
             else:
                 year_salary = 0.0
-                # 啟動政府公式推算退休金
-                calc_salary = mainSalary if mainSalary < 45800 else 45800
+                calc_salary = payload.main_salary if payload.main_salary < 45800 else 45800
                 year_pension = calc_salary * payload.pension.lb_current_years * 0.0155 * 12
-                year_living_exp = (payload.base_m_exp * (t.replacement_rate)) * 12 * ((1 + t.inflation_rate) ** (age - t.retire_age))
+                year_living_exp = (payload.base_m_exp * t.replacement_rate) * 12 * ((1 + t.inflation_rate) ** (age - t.retire_age))
 
             # 當年總流入與總流出核算
             total_inflow = year_salary + year_pension + cur_extra_inc_gross + ins_survival_total
             total_outflow = year_living_exp + year_mortgage_pay + year_debt_pay + ins_premium_total
             
             # --- 4. 年度綜合所得稅與最低稅負制 (AMT) 合流最優化試算 ---
-            # 建立法定免稅額與扣除額護城河
             is_spouse_alive = f.has_spouse and (f.sp_age + yrs < f.sp_life)
             tax_people = 1 + (1 if is_spouse_alive else 0) + len(f.kids) + (1 if f.has_father else 0) + (1 if f.has_mother else 0)
             
-            exemption_pool = 97000 * tax_people # 2024最新綜合所得稅免稅額
+            exemption_pool = 97000 * tax_people
             std_deduction = 131000 * (2 if is_spouse_alive else 1)
             salary_deduction = 218000 if age < t.retire_age else 0
             
-            # 列舉扣除額防禦檢驗 (房貸利息上限 30 萬)
             itemized_mortgage = min(year_mortgage_interest_wan * 10000, 300000)
             chosen_deduction = max(std_deduction, itemized_mortgage)
             
-            # 計算綜合所得淨額
             gross_income_total = year_salary + cur_extra_inc_taxable
             net_income_taxable = max(0, gross_income_total - exemption_pool - chosen_deduction - salary_deduction)
             
-            # 所得稅與最低稅負制 (AMT 750 萬門檻) 兩者取其高
             general_income_tax = calc_tw_income_tax(net_income_taxable)
-            amt_basic_income = net_income_taxable + 0.0 # 此處可擴充海外所得
+            amt_basic_income = net_income_taxable + 0.0
             amt_tax = max(0, amt_basic_income - 7500000) * 0.2
             
             final_year_tax = max(general_income_tax, amt_tax)
@@ -272,26 +266,21 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
             net_year_cashflow = total_inflow - total_outflow
             cur_bal["日常活存"] += net_year_cashflow
 
-            # 資產利息與複利滾存
             for name in cur_bal.keys():
                 cur_bal[name] = cur_bal[name] * (1 + rate_dict.get(name, 0.01))
 
-            # 統計當年度資產總額
             year_total_assets_wan = (sum(cur_bal.values()) / 10000) + total_cv_wan
             
             # --- 5. 當年度模擬身故民法與傳承遺產稅預估 ---
-            estate_tax_exempt = 1333.0 # 遺產稅免稅額 1333 萬
-            estate_deductions = 138.0  # 喪葬費扣除額 138 萬
+            estate_tax_exempt = 1333.0
+            estate_deductions = 138.0
             if is_spouse_alive:
-                estate_tax_exempt += 553.0 # 配偶扣除額 553 萬
-            estate_tax_exempt += (56.0 * len(f.kids)) # 直系卑親屬扣除額 56 萬/人
+                estate_tax_exempt += 553.0
+            estate_tax_exempt += (56.0 * len(f.kids))
             
-            # 剩餘財產差額分配請求權試算 (簡化對沖模型)
             sp_claim_wan = max(0, (year_total_assets_wan - f.sp_wealth) / 2) if is_spouse_alive else 0.0
-            
             taxable_estate_net = max(0, year_total_assets_wan - estate_tax_exempt - sp_claim_wan)
             
-            # 台灣法定遺產稅三級累進稅率 (10%, 15%, 20%)
             if taxable_estate_net <= 5621:
                 estate_tax_wan = taxable_estate_net * 0.1
             elif taxable_estate_net <= 11242:
@@ -315,7 +304,6 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"核心精算引擎崩潰: {str(e)}")
 
-# 本地調試與 Render 啟動入口
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
