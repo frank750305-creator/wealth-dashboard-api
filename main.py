@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 import math
 
-app = FastAPI(title="高資產傳承與所得稅擇優核算大腦", version="3.5")
+app = FastAPI(title="高資產傳承與所得稅擇優核算大腦", version="3.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,7 +14,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. 資料結構對接 Schema ---
 class TimelineSchema(BaseModel):
     current_age: int
     life_expectancy: int
@@ -146,7 +145,6 @@ def calc_tw_tax(net_inc: float) -> float:
     elif net_inc <= 498: return net_inc * 0.30 - 39.2
     else: return net_inc * 0.40 - 89.0
 
-# --- 2. 核心運算路由 ---
 @app.post("/api/v1/wealth/simulate")
 async def simulate_wealth_trajectory(payload: SimulationPayload):
     try:
@@ -177,7 +175,6 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
             cur_house = 0.0
             item_mortgage_interest = 0.0
             
-            # 房貸與繳息
             for h in payload.mortgages:
                 if h.start <= age < h.start + h.years:
                     p_yrs = age - h.start
@@ -189,14 +186,13 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                         if h.claim_tax: item_mortgage_interest += interest / 10000
                     else:
                         amort_months = (h.years - h.grace) * 12
-                        pmt = (loan_yuan * m_rate * (1+m_rate)**amort_months) / ((1+m_rate)**amort_months - 1)
+                        pmt = (loan_yuan * m_rate * (1+m_rate)**amort_months) / ((1+m_rate)**amort_months - 1) if m_rate > 0 else loan_yuan / amort_months
                         cur_house += pmt * 12
-                        year_interest = loan_yuan * (h.rate / 100) # 概估
+                        year_interest = loan_yuan * (h.rate / 100) 
                         if h.claim_tax: item_mortgage_interest += year_interest / 10000
 
             cur_debt = sum(d.monthly_pay * 12 for d in payload.debts if d.start <= age < d.start + d.years)
 
-            # 多元所得拆解
             cur_extra_inc_gross = 0.0
             cur_extra_inc_net_taxable = 0.0
             total_9b_annual = 0.0
@@ -209,7 +205,6 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                 else: cur_extra_inc_net_taxable += annual_gross
             if total_9b_annual > 180000: cur_extra_inc_net_taxable += (total_9b_annual - 180000)
 
-            # 保單現金流
             ins_premium_total = 0.0
             ins_survival_total = 0.0
             total_cv_wan = 0.0
@@ -255,7 +250,6 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
             cur_inc = temp_salary + cur_extra_inc_gross + temp_pension + ins_survival_total
             current_year_net_inflow = cur_inc - display_living_exp - cur_house - cur_debt - ins_premium_total
 
-            # --- 所得稅最佳化擇優雙軌計算 ---
             is_spouse_alive = f.has_spouse and (f.sp_age + yrs < f.sp_life)
             tax_people = 1 + (1 if is_spouse_alive else 0) + len(f.kids) + (1 if f.has_father else 0) + (1 if f.has_mother else 0)
             total_exemption = (tp["exemption"] * 1.5) if age >= 70 else tp["exemption"]
@@ -290,7 +284,7 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
             savings_deduction = min(interest_inc, tp["savings_limit"])
             taxable_interest = interest_inc - savings_deduction
             std_deduction = tp["std_deduction"] * (2 if is_spouse_alive else 1)
-            item_ins = min((mInsurance * 12) / 10000 if 'mInsurance' in globals() else 2.4, tp["ins_limit"] * tax_people)
+            item_ins = min(2.4 * tax_people, tp["ins_limit"] * tax_people) 
             item_mortgage_final = min(max(0.0, item_mortgage_interest - savings_deduction), tp["mortgage_limit"])
             final_deduction = max(std_deduction, item_ins + item_mortgage_final)
             
@@ -298,17 +292,20 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
             basic_living_diff = max(0.0, (tax_people * tp["basic_living"]) - (total_exemption + final_deduction + total_special_ded))
             user_sal_ded = min(user_salary_wan, tp["salary_deduction"])
 
-            # 雙軌計稅自動擇優
+            # 🛠️ 修復：定義綜合所得總額變數
+            gross_income_total = user_salary_wan + biz_other_wan + taxable_interest + dividend_inc
+
             def check_tax(add_div):
                 gross = user_salary_wan + biz_other_wan + taxable_interest + (dividend_inc if add_div else 0.0)
                 net = max(0.0, gross - total_exemption - final_deduction - total_special_ded - basic_living_diff - user_sal_ded)
                 return calc_tw_tax(net), net
 
+            # 🛠️ 修復：統一變數名稱為 tax_scenario_1 與 tax_scenario_2
             tax_joint, joint_net = check_tax(add_div=True)
-            tax_scen1 = max(0.0, tax_joint - min(dividend_inc * 0.085, 8.0))
+            tax_scenario_1 = max(0.0, tax_joint - min(dividend_inc * 0.085, 8.0))
             tax_no_div, _ = check_tax(add_div=False)
-            tax_scen2 = tax_no_div + (dividend_inc * 0.28)
-            general_tax = min(tax_scen1, tax_scen2)
+            tax_scenario_2 = tax_no_div + (dividend_inc * 0.28)
+            general_tax = min(tax_scenario_1, tax_scenario_2)
 
             basic_income = joint_net + overseas_inc + amt_ins_inc
             amt_tax = max(0.0, basic_income - tp["amt_threshold"]) * 0.2
@@ -316,7 +313,6 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
             
             current_year_net_inflow -= (final_income_tax_wan * 10000)
 
-            # 現金流對沖與救火隊排程
             if current_year_net_inflow > 0:
                 if accumulated_deficit > 0:
                     payoff = min(current_year_net_inflow, accumulated_deficit)
@@ -334,12 +330,10 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                             deficit -= take
                 if deficit > 0: accumulated_deficit += deficit
 
-            # 資產加總
             total_a = sum(cur_bal.values())
             total_a_wan = (total_a / 10000) + total_cv_wan
             total_liab_wan = (cur_debt + accumulated_deficit) / 10000
 
-            # 遺產免稅資產與扣除
             total_a_wan_estate = total_a_wan + estate_cv_addition_wan
             ded_total = 1333.0 + 138.0
             ded_details = {"免稅額": 1333.0, "喪葬費": 138.0}
@@ -348,8 +342,9 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                 alive_dict["配偶"].append({"name": "配偶"})
                 ded_total += 553.0; ded_details["配偶扣除額"] = 553.0
             for k in f.kids:
-                alive_dict["子女"].append({"name": k.id})
-                ded_total += 56.0 + max(0.0, (18 - (k.age + yrs)) * 56.0)
+                if k.age + yrs <= k.life:
+                    alive_dict["子女"].append({"name": k.id})
+                    ded_total += 56.0 + max(0.0, (18 - (k.age + yrs)) * 56.0)
             
             sp_claim_wan = max(0.0, (total_a_wan_estate - f.sp_wealth) / 2) if is_spouse_alive else 0.0
             taxable_net_wan = max(0.0, total_a_wan_estate - total_liab_wan - min(f.daily_tool_val, 100.0) - min(f.job_tool_val, 56.0) - sp_claim_wan - ded_total)
@@ -377,3 +372,7 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
         return {"trajectory": trajectory}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"核心引擎精算異常: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
