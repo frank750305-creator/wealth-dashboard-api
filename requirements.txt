@@ -1,6 +1,9 @@
+Plaintext
 fastapi
 uvicorn
 pandas
 sqlalchemy
 aiosqlite
 asyncpg
+pydantic
+numpy

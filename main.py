@@ -180,16 +180,31 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                     p_yrs = age - h.start
                     loan_yuan = h.loan_amount * 10000
                     m_rate = (h.rate / 100) / 12
+                    
                     if p_yrs < h.grace:
                         interest = loan_yuan * (h.rate / 100)
                         cur_house += interest
                         if h.claim_tax: item_mortgage_interest += interest / 10000
                     else:
-                        amort_months = (h.years - h.grace) * 12
-                        pmt = (loan_yuan * m_rate * (1+m_rate)**amort_months) / ((1+m_rate)**amort_months - 1) if m_rate > 0 else loan_yuan / amort_months
-                        cur_house += pmt * 12
-                        year_interest = loan_yuan * (h.rate / 100) 
-                        if h.claim_tax: item_mortgage_interest += year_interest / 10000
+                        amort_p_yrs = p_yrs - h.grace
+                        a_yrs = h.years - h.grace
+                        
+                        if h.method == "本金平均":
+                            p_ann = loan_yuan / a_yrs if a_yrs > 0 else 0
+                            current_rem_loan = max(0.0, loan_yuan - (p_ann * amort_p_yrs))
+                            year_interest = max(0.0, current_rem_loan * (h.rate / 100))
+                            cur_house += (p_ann + year_interest)
+                            if h.claim_tax: item_mortgage_interest += year_interest / 10000
+                        else:
+                            amort_months = a_yrs * 12
+                            pmt = (loan_yuan * m_rate * (1+m_rate)**amort_months) / ((1+m_rate)**amort_months - 1) if m_rate > 0 else loan_yuan / amort_months
+                            cur_house += pmt * 12
+                            
+                            months_passed = amort_p_yrs * 12
+                            if amort_months > months_passed:
+                                current_rem_loan = loan_yuan * (((1+m_rate)**amort_months - (1+m_rate)**months_passed) / ((1+m_rate)**amort_months - 1)) if m_rate > 0 else loan_yuan - (pmt * months_passed)
+                                year_interest = current_rem_loan * (h.rate / 100)
+                                if h.claim_tax: item_mortgage_interest += year_interest / 10000
 
             cur_debt = sum(d.monthly_pay * 12 for d in payload.debts if d.start <= age < d.start + d.years)
 
