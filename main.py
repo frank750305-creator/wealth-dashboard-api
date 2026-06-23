@@ -473,6 +473,8 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
             sp_sal_ded = min(sp_salary_wan, tp["salary_deduction"]) if is_spouse_alive else 0.0
             total_other_inc_ex_div = biz_other_wan + sp_other_wan + dependent_income_wan + taxable_interest
 
+            gross_income_total = user_salary_wan + sp_salary_wan + biz_other_wan + sp_other_wan + dependent_income_wan + interest_inc + dividend_inc
+
             def calc_tax_scenarios(add_dividend):
                 current_other_inc = total_other_inc_ex_div + (dividend_inc if add_dividend else 0)
                 net_joint = max(0.0, user_salary_wan + sp_salary_wan + current_other_inc - total_exemption - final_deduction - total_special_ded - basic_living_diff - user_sal_ded - sp_sal_ded)
@@ -639,7 +641,7 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
         return {
             "trajectory": trajectory,
             "first_year_loan_pay": first_year_loan_pay_calc,
-            "first_year_tax": trajectory[0]["稅_應納稅金"] if trajectory else 0.0
+            "first_year_tax": trajectory[0]["第一年預估稅金"] if trajectory else 0.0
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"核心引擎精算異常: {str(e)}")
