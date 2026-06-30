@@ -207,7 +207,6 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
         cur_bal = {a.name: a.value * 10000 for a in payload.assets}
         sub_to_cat = {a.name: a.type for a in payload.assets}
         rate_dict = {a.name: a.rate for a in payload.assets}
-        tax_dict = {a.name: a.tax_type for a in payload.assets}
         
         if "預設現金" not in cur_bal:
             cur_bal["預設現金"] = 0.0
@@ -473,8 +472,6 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
             sp_sal_ded = min(sp_salary_wan, tp["salary_deduction"]) if is_spouse_alive else 0.0
             total_other_inc_ex_div = biz_other_wan + sp_other_wan + dependent_income_wan + taxable_interest
 
-            gross_income_total = user_salary_wan + sp_salary_wan + biz_other_wan + sp_other_wan + dependent_income_wan + interest_inc + dividend_inc
-
             def calc_tax_scenarios(add_dividend):
                 current_other_inc = total_other_inc_ex_div + (dividend_inc if add_dividend else 0)
                 net_joint = max(0.0, user_salary_wan + sp_salary_wan + current_other_inc - total_exemption - final_deduction - total_special_ded - basic_living_diff - user_sal_ded - sp_sal_ded)
@@ -545,6 +542,9 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                         deficit -= take
                 if deficit > 0: accumulated_deficit += deficit
 
+            # 🔥 完美對齊：補回所有分類與獨立資產的數值
+            row_data["累積財務缺口"] = accumulated_deficit / 10000
+
             cat_totals = {c: 0.0 for c in ["現金", "保單", "基金", "債券", "股票", "其他", "不動產"]}
             total_a = 0.0
             for nm, val in cur_bal.items():
@@ -552,10 +552,18 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
                 cur_bal[nm] = val
                 cat = sub_to_cat.get(nm, "其他")
                 if cat in cat_totals: cat_totals[cat] += val
+                row_data[nm] = val
                 total_a += val
                 
+            for c, v in cat_totals.items():
+                row_data[c] = v
+                
             total_a_wan = (total_a / 10000) + total_cv_wan
+            row_data["總資產"] = total_a_wan
+            
             total_liab_wan = (current_mortgage_principal + current_debt_principal + accumulated_deficit) / 10000
+            row_data["總負債"] = total_liab_wan
+            row_data["淨資產"] = total_a_wan - total_liab_wan
 
             total_a_wan_estate = total_a_wan + estate_cv_addition_wan
 
@@ -620,19 +628,45 @@ async def simulate_wealth_trajectory(payload: SimulationPayload):
 
             legal_inherit_base = max(0.0, total_a_wan_estate - total_liab_wan - sp_claim_wan)
 
+            # 🔥 完美對齊：字典的 Key 名稱與運算邏輯徹底還原 Streamlit 版本
             row_data.update({
-                "總資產_萬": round(total_a_wan, 0), "預估遺產稅_萬": round(tax_wan, 0), "差額分配請求權": round(sp_claim_wan, 0),
-                "扣除額總計": ded_total, "收_年金收入": round(temp_pension, 0), "支_所得稅金": round(final_income_tax_wan * 10000, 0),
-                "收_主業薪資": round(temp_salary, 0), "收_其他所得": round(cur_extra_inc_gross, 0), "收_保險還本": round(ins_survival_total, 0),
-                "支_生活開銷": round(display_living_exp, 0), "支_保險費": round(ins_premium_total, 0),
-                "支_房貸繳款": round(cur_house, 0), "支_信貸繳款": round(cur_debt, 0), "支_自提勞退": round(temp_pension_vol, 0),
-                "保單總價值": total_cv_wan, "保單理賠分配": insurance_payouts, "身故觸發受益人AMT_預估": trigger_amt_base,
-                "民法繼承基數": legal_inherit_base, "可分配餘額": total_a_wan_estate - total_liab_wan - tax_wan - sp_claim_wan,
-                "扣除額明細": ded_details, "存活字典": alive_dict, "股利計稅": chosen_div_type, "觸發AMT": "是" if amt_tax > general_tax else "否",
-                "稅_綜合所得總額": gross_income_total, "稅_綜合所得淨額": joint_net_inc, "稅_一般應納稅額": general_tax,
-                "稅_AMT基本所得額": basic_income, "稅_AMT稅額": amt_tax, "稅_免稅額": total_exemption, "稅_扣除額": final_deduction,
-                "稅_特扣總計": total_special_ded, "稅_基本差額": basic_living_diff, "稅_申報人數": tax_people, "扣除額類型": chosen_ded_type,
-                "累積財務缺口": accumulated_deficit / 10000, 
+                "收_主業薪資": temp_salary,
+                "收_其他所得": temp_extra_inc,
+                "收_年金收入": temp_pension,
+                "收_保險還本": ins_survival_total, 
+                "支_生活開銷": display_living_exp,
+                "支_保險費": ins_premium_total,    
+                "支_房貸繳款": cur_house,
+                "支_信貸繳款": cur_debt,
+                "支_自提勞退": temp_pension_vol,
+                "支_所得稅金": final_income_tax_wan * 10000,
+                
+                "保單總價值": total_cv_wan, 
+                "保單理賠分配": insurance_payouts, 
+                "身故觸發受益人AMT_預估": trigger_amt_base, 
+                
+                "預估遺產稅": tax_wan, 
+                "差額分配請求權": sp_claim_wan, 
+                "扣除額總計": ded_total,
+                "民法繼承基數": legal_inherit_base, 
+                "可分配餘額": total_a_wan_estate - total_liab_wan - tax_wan - sp_claim_wan, 
+                "扣除額明細": ded_details, 
+                "存活字典": alive_dict,
+                "稅_應納稅金": final_income_tax_wan, 
+                "稅_申報人數": tax_people, 
+                "稅_基本差額": basic_living_diff,
+                "稅_免稅額": total_exemption, 
+                "稅_扣除額": final_deduction, 
+                "扣除額類型": chosen_ded_type,
+                "股利計稅": chosen_div_type, 
+                "觸發AMT": "是" if amt_tax > general_tax else "否",
+                "稅_綜合所得總額": user_salary_wan + sp_salary_wan + total_other_inc_ex_div + dividend_inc,
+                "稅_特扣總計": total_special_ded + user_sal_ded + sp_sal_ded,
+                "稅_綜合所得淨額": joint_net_inc, 
+                "稅_一般應納稅額": general_tax,
+                "稅_AMT基本所得額": basic_income, 
+                "稅_AMT稅額": amt_tax,
+
                 "第一年預估房貸支出": first_year_loan_pay_calc,
                 "第一年預估稅金": final_income_tax_wan * 10000
             })
